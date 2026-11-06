@@ -1,0 +1,208 @@
+"""OpenAI 兼容文本 Provider（httpx 直连，无额外 SDK 依赖）。
+
+同一实现复用于一切 OpenAI 兼容端点：DeepSeek、百炼 qwen（含模型市场专属端点）。
+支持 qwen3 系思考模式：enable_thinking → 流式输出，reasoning_content 与 content 分离，
+本实现只累积 content（思考过程可经 meta 观测），保证下游拿到纯净回答。
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+import httpx
+from pydantic import BaseModel
+
+from fastvideo.providers.base import ProviderError, TextProvider, api_retry, raise_for_status
+
+
+def parse_sse_data(line: str) -> dict | None:
+    """解析单行 SSE：`data: {...}`；空行/注释/[DONE]/坏 JSON 一律返回 None。"""
+    line = line.strip()
+    if not line.startswith("data:"):
+        return None
+    payload = line[len("data:") :].strip()
+    if not payload or payload == "[DONE]":
+        return None
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def usage_tokens(data: dict | None) -> dict[str, Any]:
+    """从 OpenAI 兼容响应里取**计费 token 量**，归一成 `{tokens_in, tokens_out, source}`。
+
+    为什么必须有它：文本类模型官网是按 token 计价的（元/百万 Token，输入/输出两个价），
+    "一次调用"不是计费单位。丢掉 usage 就只能按次估 —— 台账显示 `text ¥0.000`、
+    账单却在跑，就是 2026-10-12 那次成本失真的直接原因。
+    字段名两家不一样（`prompt_tokens/completion_tokens` 与 `input_tokens/output_tokens`），
+    所以两套都认；都没有就返回空 dict（调用方据此标"未量到"，**不许猜**）。
+    """
+    usage = (data or {}).get("usage")
+    if not isinstance(usage, dict):
+        return {}
+
+    def pick(*names: str) -> float:
+        for n in names:
+            v = usage.get(n)
+            if isinstance(v, (int, float)) and v > 0:
+                return float(v)
+        return 0.0
+
+    tin = pick("prompt_tokens", "input_tokens")
+    tout = pick("completion_tokens", "output_tokens")
+    if not (tin or tout):
+        return {}
+    return {"tokens_in": tin, "tokens_out": tout, "source": "api_usage.usage"}
+
+
+class OpenAICompatTextProvider(TextProvider):
+    name = "openai_compat"
+    model = ""
+
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str,
+        model: str,
+        name: str = "openai_compat",
+        enable_thinking: bool = False,
+        timeout_sec: float | None = None,
+    ):
+        if not api_key:
+            raise ProviderError(
+                f"{name}: 缺少 API KEY，请在 .env 中配置"
+                f"（模型 {model} 需要的 KEY 没有，但请求仍会被发到 {base_url} —— 那样只会等到读超时）"
+            )
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.name = name
+        self.enable_thinking = enable_thinking
+        # connect 单独给小值：端点不可达/DNS/证书问题必须在几秒内报出来，而不是占用
+        # 整个 read 预算；read 才是"模型真的在写长剧本"的时间（FV3_TEXT_TIMEOUT_SEC 可调）。
+        self.timeout_sec = float(timeout_sec or 180.0)
+        self.timeout = httpx.Timeout(self.timeout_sec, connect=15.0)
+
+    def _headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+
+    @api_retry(attempts=3)
+    async def chat(
+        self,
+        messages: list[dict[str, str]],
+        json_schema: type[BaseModel] | None = None,
+        **kwargs: Any,
+    ) -> str:
+        msgs = list(messages)
+        if json_schema is not None:
+            schema_hint = json.dumps(json_schema.model_json_schema(), ensure_ascii=False)
+            msgs = msgs + [
+                {
+                    "role": "system",
+                    "content": (
+                        "你必须只输出一个合法 JSON 对象，严格符合以下 JSON Schema，"
+                        "不要输出 markdown 代码块或任何解释文字。\n" + schema_hint
+                    ),
+                }
+            ]
+        body: dict[str, Any] = {
+            "model": self.model,
+            "messages": msgs,
+            "temperature": kwargs.get("temperature", 0.7),
+        }
+        if self.enable_thinking:
+            # 思考模式：必须流式；不与 response_format 共用（模型限制）
+            body["enable_thinking"] = True
+            return await self._stream_chat(body)
+        if json_schema is not None:
+            body["response_format"] = {"type": "json_object"}
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            try:
+                resp = await client.post(
+                    f"{self.base_url}/chat/completions", headers=self._headers(), json=body
+                )
+            except httpx.TimeoutException as e:
+                # `str(httpx.ReadTimeout())` 是**空串** —— 事件里因此只留下 kind=ReadTimeout
+                # 和一个空的 error，人完全看不出"在等谁、等了多久、该怎么办"（2026-10-14 实测）。
+                raise ProviderError(
+                    f"{self.name} 模型 {self.model} 在 {self.base_url} 读取超时"
+                    f"（read={self.timeout_sec:.0f}s，含重试最多约 {self.timeout_sec * 3:.0f}s）。"
+                    f"出路：① 换成目录内模型（文本默认 qwen3.7-flash）；② 名字确实是这家模型的，"
+                    f"检查对应的 KEY 是否配置；③ 确实需要更久，设 FV3_TEXT_TIMEOUT_SEC=300。"
+                ) from e
+        data = (
+            resp.json()
+            if resp.headers.get("content-type", "").startswith("application/json")
+            else {}
+        )
+        raise_for_status(resp, data if isinstance(data, dict) else None)
+        # 计费量落到实例上，台账按 token 记（见 Provider.last_usage）
+        self.last_usage = usage_tokens(data if isinstance(data, dict) else None)
+        try:
+            return data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as e:
+            raise ProviderError(f"{self.name}: 响应结构异常: {str(data)[:200]}") from e
+
+    @api_retry(attempts=2)
+    async def _stream_chat(self, body: dict[str, Any]) -> str:
+        """SSE 流式收集 content（跳过 reasoning_content 思考过程）。
+
+        同时要 `usage`：思考模式**必须**流式，而按 token 计价的钱就在这条响应里。
+        不开 `stream_options.include_usage` 的话，流式调用一个计费量都拿不到 →
+        台账只能记 ¥0，那正是这次成本失真的形状。取不到就留空（标"未量到"），不猜。
+        """
+        body = dict(body)
+        body["stream"] = True
+        body["stream_options"] = {"include_usage": True}
+        parts: list[str] = []
+        usage: dict[str, Any] = {}
+        stream_timeout = httpx.Timeout(max(300.0, self.timeout_sec * 2), connect=15.0)
+        async with httpx.AsyncClient(timeout=stream_timeout) as client:
+            async with client.stream(
+                "POST", f"{self.base_url}/chat/completions", headers=self._headers(), json=body
+            ) as resp:
+                if resp.status_code >= 400:
+                    await resp.aread()
+                    raise_for_status(resp)
+                async for line in resp.aiter_lines():
+                    data = parse_sse_data(line)
+                    if data is None:
+                        continue
+                    got = usage_tokens(data)
+                    if got:  # usage 在最后一个分片上（choices 为空），先于 delta 取
+                        usage = got
+                    try:
+                        delta = data["choices"][0].get("delta") or {}
+                    except (KeyError, IndexError, TypeError):
+                        continue
+                    content = delta.get("content")
+                    if content:
+                        parts.append(content)
+        if not parts:
+            raise ProviderError(f"{self.name}: 流式响应为空")
+        self.last_usage = usage
+        return "".join(parts)
+
+
+class DeepSeekTextProvider(OpenAICompatTextProvider):
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str = "https://api.deepseek.com",
+        model: str = "deepseek-chat",
+        timeout_sec: float | None = None,
+    ):
+        super().__init__(api_key, base_url, model, name="deepseek", timeout_sec=timeout_sec)
+
+
+def strip_code_fence(text: str) -> str:
+    """容错剥离 LLM 偶尔输出的 ```json 围栏。"""
+    t = text.strip()
+    if t.startswith("```"):
+        t = t.split("\n", 1)[1] if "\n" in t else t[3:]
+        if t.rstrip().endswith("```"):
+            t = t.rstrip()[:-3]
+    return t.strip()

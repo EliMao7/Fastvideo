@@ -1,0 +1,22 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+output/
+models/*.pt
+build/
+dist/
+*.egg-info/
+.coverage
+node_modules/
+web/dist/
+.claude/settings.local.json
+
+# ── 项目内置运行时（`fastvideo provision` 生成，二进制不入库）──
+bin/*
+!bin/README.md
+models/*.onnx
+models/*.part

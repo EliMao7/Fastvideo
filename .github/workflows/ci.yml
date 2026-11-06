@@ -1,0 +1,74 @@
+# FastVideo CI（TDD §12.3）：每模块合并门禁 + nightly 真实 API 冒烟
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 18 * * *"   # nightly: 真实 API 冒烟
+
+jobs:
+  lint-type-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install (dev, 无重型本地组件)
+        run: |
+          pip install -e ".[dev]"
+      - name: Placeholder .env for tests
+        # 用例读的是 .env 里的"实际生效值"（缺 .env 时预算默认 0 → 熔断判据误报）；
+        # CI 不打真实计费端点，给占位值即可，真实 KEY 只在 nightly 用 secrets。
+        run: |
+          printf 'DASHSCOPE_API_KEY=sk-ci-placeholder\nFV3_BUDGET_LIMIT_CNY=120\nFV3_FAKE=0\n' > .env
+      - name: Install CJK font (字幕/标题卡字体检测)
+        # runner 镜像不带中文字体，cjk_font() 会返回空 → subtitle_style 的家族名断言失败。
+        # 装 wqy-microhei 与 fastvideo/utils/image.py 的候选路径一一对应。
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends fonts-wqy-microhei
+      - name: Lint (ruff)
+        run: |
+          ruff check .
+          ruff format --check .
+      - name: Type (mypy)
+        run: mypy fastvideo
+      - name: Unit + Fake 全链路冒烟
+        run: pytest -m "not api" --cov=fastvideo --cov-report=term-missing
+
+  web-build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install frontend deps
+        run: npm ci
+      - name: Build Vue frontend
+        run: npm run build
+
+  nightly-api-smoke:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - name: Real API smoke (minimal, budget < ¥5)
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+        run: pytest -m api

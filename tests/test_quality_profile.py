@@ -1,0 +1,210 @@
+"""分辨率档回归：profile overlay / cover 裁切 / 稳定种子 / 内置 BGM。
+
+背景：480P 档成片"粗糙简陋"的根因 = 低分辨率源 + 黑边 + 画风不一 + 无包装；
+720P/1080P 档与对应工程手段必须有测试守住。
+
+档位名就是分辨率（480P = `default.yaml` 本体，720P/1080P 各叠一层 `profile_<档>.yaml`）：以前还有一层
+economy/high/cinema 的名字，与分辨率一对一 —— 两个旋钮表达同一件事，就必然出现
+"cinema + 480P"这种自相矛盾的组合（talkmode 里曾专门为它写特例），所以删掉了。
+"""
+
+from __future__ import annotations
+
+from fastvideo.core import config as config_mod
+from fastvideo.core.config import PROJECT_ROOT, load_config
+from fastvideo.core.schema import Shot, ShotType
+from fastvideo.utils import ffmpeg as ff
+
+
+def test_deep_merge_partial_override():
+    merged = config_mod._deep_merge({"a": {"b": 1, "c": 2}, "d": 5}, {"a": {"c": 3}, "e": 9})
+    assert merged == {"a": {"b": 1, "c": 3}, "d": 5, "e": 9}
+
+
+def test_load_config_720p_profile_overlay(tmp_path, monkeypatch):
+    monkeypatch.setenv("FV3_RESOLUTION", "720P")
+    cfg = load_config(dotenv_path=tmp_path / "none.env")
+    assert cfg.i2v_resolution == "720P"
+    # 尺寸由 RESOLUTION_SIZES 落定（唯一来源）：档位 yaml 不再自己写 resolution，
+    # 否则又会出现"选 720P、按 1080P 出片"
+    assert cfg.resolution == (720, 1280)
+    # 文生图**不再按档各写一份**（2026-10-17）：三档同一个出厂模型，差别只可能来自
+    # 「模型选择」里用户点的那一名。所以这里断言的是"与 480P 完全相同"，而不是某个档位值。
+    assert cfg.models["dashscope_t2i27"] == "wan2.7-image"
+    assert cfg.routing["t2i"].default == "dashscope_wan27_image"
+    # 图生视频只剩 wan3.0：720P 与 480P 只差分辨率档，不再是另一套模型
+    assert cfg.models["dashscope_i2v"] == "wan3.0-video"
+    assert "动漫" in cfg.negative_prompt  # 防卡通化硬约束在档
+    assert cfg.style_suffix  # 全局风格锚非空
+    assert cfg.color_grade and cfg.loudnorm
+
+
+def test_load_config_480p_default_untouched(tmp_path):
+    """480P = `default.yaml` 本体：画质与包装项仍是教学档，**一致性一项都不许少**。
+
+    "untouched" 只指画质/后期那些花钱项。2026-10-17 起参考图锁脸不再随分辨率关掉
+    （细节与档位判据在 `tests/test_480p_face_lock.py`，这里只钉最显眼的两位）。
+    """
+    cfg = load_config(dotenv_path=tmp_path / "none.env")
+    assert cfg.i2v_resolution == "480P"
+    assert cfg.resolution == (540, 960)
+    assert cfg.i2v_resolution == "480P"
+    assert not cfg.color_grade
+    # 一致性：锁脸 + 度量都开，自动重拍关（重拍一段 ¥6–17，教学档不自动烧）
+    assert cfg.use_reference_keyframes and cfg.require_reference_keyframes
+    assert cfg.consistency_metric == "sample" and cfg.consistency_gate == "off"
+    # 新增质量开关的默认值（480P 不抽卡、不自动重拍的成本取向不变）
+    assert cfg.asset_candidates == 1
+    # 剧本评审交给人工：一次生成，只有台词句长违规才允许重写一次
+    assert cfg.max_script_revisions == 1
+    assert not cfg.auto_reshoot
+    assert cfg.output_fps == 24
+    assert cfg.intermediate_crf == 18
+
+
+def test_load_config_1080p_profile_overlay(tmp_path, monkeypatch):
+    """1080P 档：商业级配置全量生效（抽卡/锁脸/评审/选优模型）。
+
+    剧本 critic 已下线（评审剧本的是人），但**其他评审必须还在**：分镜 VLM 一致性全检、
+    镜头 best-of-N 选优、结构化外貌卡 —— 这三条是锁脸链路的判定来源，掉了就是"看起来
+    跑了、实际没通电"。
+    """
+    monkeypatch.setenv("FV3_RESOLUTION", "1080P")
+    cfg = load_config(dotenv_path=tmp_path / "none.env")
+    assert cfg.i2v_resolution == "1080P"
+    assert cfg.resolution == (1080, 1920)
+    assert cfg.use_r2v_for_characters and cfg.use_reference_keyframes
+    assert cfg.candidates_per_shot == 2
+    assert cfg.asset_candidates == 2  # 角色立绘抽卡选优
+    assert cfg.storyboard_sample_rate == 1.0  # 分镜 VLM 一致性全检
+    assert cfg.look_extraction is True  # 外貌卡：蒸馏校验与度量的属性来源
+    # 兑现"qwen-vl-max 打分取优"（此前 yaml 未覆盖 vlm，静默继承 plus 档）
+    assert cfg.models["dashscope_vlm"] == "qwen-vl-max"
+
+
+def test_load_config_high_profile_keeps_other_reviews(tmp_path, monkeypatch):
+    """720P 档：剧本评审没了，但抽卡/外貌卡/分镜抽查都还在（成本只降在立绘上）。"""
+    monkeypatch.setenv("FV3_RESOLUTION", "720P")
+    cfg = load_config(dotenv_path=tmp_path / "none.env")
+    assert cfg.look_extraction is True
+    assert cfg.storyboard_sample_rate > 0
+    assert cfg.asset_candidates == 1  # 720P 档不抽卡（成本取舍）
+
+
+def test_script_critic_knob_is_gone(tmp_path, monkeypatch):
+    """`script_review` 这个配置位必须真的消失：留着不生效的开关就是下一个"假通电"故障。"""
+    monkeypatch.setenv("FV3_RESOLUTION", "1080P")
+    cfg = load_config(dotenv_path=tmp_path / "none.env")
+    assert not hasattr(cfg, "script_review")
+    for name in ("configs/default.yaml", "configs/profile_720P.yaml", "configs/profile_1080P.yaml"):
+        assert "script_review" not in (PROJECT_ROOT / name).read_text(encoding="utf-8"), name
+
+
+def test_normalize_cover_fills_frame_no_black_bars(tmp_path):
+    """源画幅与目标不一致时 cover 裁切必须满屏（旧 pad 会留黑边）。"""
+    from PIL import Image
+
+    png = tmp_path / "odd.png"
+    Image.new("RGB", (100, 190), (200, 40, 40)).save(png)  # 0.526 ≠ 9:16 的 0.5625
+    src = tmp_path / "odd.mp4"
+    ff.image_to_video(png, src, duration=1.0)  # normalize 只收视频源（与实际调用一致）
+    out = tmp_path / "n.mp4"
+    ff.normalize_clip(src, out, (54, 96))
+    assert ff.probe_size(out) == (54, 96)
+    frame = tmp_path / "f.png"
+    ff.run_ffmpeg(["-i", str(out), "-frames:v", "1", str(frame)])
+    im = Image.open(frame).convert("RGB")
+    for corner in ((2, 2), (51, 2), (2, 93), (51, 93)):
+        assert sum(im.getpixel(corner)) > 60, f"角落 {corner} 是黑边"
+
+
+def test_stable_seed_deterministic_per_scene_cast():
+    a = Shot(
+        shot_id="s1_1", scene_id="s1", type=ShotType.DIALOGUE, action="a", characters=["rider"]
+    )
+    b = Shot(
+        shot_id="s1_2", scene_id="s1", type=ShotType.DIALOGUE, action="b", characters=["rider"]
+    )
+    c = Shot(shot_id="s2_1", scene_id="s2", type=ShotType.DIALOGUE, action="c", characters=["boss"])
+    assert _seed(a) == _seed(b)  # 同场景同角色 → 同种子（脸一致）
+    assert _seed(a) != _seed(c)  # 不同组合 → 不同种子
+
+
+def _seed(shot: Shot) -> int:
+    from fastvideo.modules.m3_storyboard import _stable_seed
+
+    return _stable_seed(shot)
+
+
+def test_builtin_bgm_shipped():
+    assert (PROJECT_ROOT / "assets" / "bgm" / "warm_ambient.wav").exists()
+
+
+def test_grade_filter_nonempty():
+    assert "eq=" in ff.grade_filter()
+
+
+async def test_m3_reference_keyframes_pass_ref_image(cfg, storage, ledger):
+    """use_reference_keyframes 开启时，角色镜头首帧必须带角色立绘参考图（硬锁脸链路）。"""
+    from fastvideo.core.schema import Asset, BaseInfo
+    from fastvideo.modules.m3_storyboard import build_storyboard
+    from fastvideo.providers.fake import FakeT2IProvider, fake_script
+
+    class RefT2I(FakeT2IProvider):
+        supports_reference_image = True
+
+        def __init__(self):
+            super().__init__()
+            self.refs: list = []
+
+        async def generate(self, prompt, **kw):
+            self.refs.append(kw.get("ref_image"))
+            return await super().generate(prompt, **kw)
+
+    cfg.use_reference_keyframes = True
+    script = fake_script(BaseInfo(topic="t"))
+    assets = {
+        f"char_{c.character_id}": Asset(
+            asset_id=f"char_{c.character_id}",
+            kind="character",
+            owner_id=c.character_id,
+            uri="ref.png",
+        )
+        for c in script.characters
+    }
+    t2i = RefT2I()
+    await build_storyboard(cfg, t2i, script, assets, storage, ledger)
+    char_shots = [s for s in script.all_shots() if s.characters]
+    assert char_shots and any(r is not None for r in t2i.refs)
+
+
+async def test_m3_no_ref_when_flag_off(cfg, storage, ledger):
+    """默认关闭：480P/720P 不传参考图（行为不变）。"""
+    from fastvideo.core.schema import Asset, BaseInfo
+    from fastvideo.modules.m3_storyboard import build_storyboard
+    from fastvideo.providers.fake import FakeT2IProvider, fake_script
+
+    class RefT2I(FakeT2IProvider):
+        supports_reference_image = True
+
+        def __init__(self):
+            super().__init__()
+            self.refs: list = []
+
+        async def generate(self, prompt, **kw):
+            self.refs.append(kw.get("ref_image"))
+            return await super().generate(prompt, **kw)
+
+    script = fake_script(BaseInfo(topic="t"))
+    assets = {
+        f"char_{c.character_id}": Asset(
+            asset_id=f"char_{c.character_id}",
+            kind="character",
+            owner_id=c.character_id,
+            uri="ref.png",
+        )
+        for c in script.characters
+    }
+    t2i = RefT2I()
+    await build_storyboard(cfg, t2i, script, assets, storage, ledger)
+    assert all(r is None for r in t2i.refs)
