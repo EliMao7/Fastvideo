@@ -5,9 +5,12 @@ on:
   push:
     branches: [main]
   pull_request:
-  schedule:
-    - cron: "17 18 * * *"   # nightly: 真实 API 冒烟
-  workflow_dispatch:        # 手动触发：想立刻跑一次真实 API 冒烟时用
+  # ── 每日真实 API 冒烟（默认关闭）──────────────────────────────────
+  # 想重新开启时，把下面两行取消注释并 push 即可（需要先在仓库 Secrets 里
+  # 配好 DASHSCOPE_API_KEY，否则 nightly gate 会把它跳过）：
+  # schedule:
+  #   - cron: "17 18 * * *"   # UTC 18:17 = 北京时间次日 02:17
+  workflow_dispatch:        # 手动触发：想立刻跑一次真实 API 冒烟就用它（Actions → CI → Run workflow）
 
 jobs:
   lint-type-unit:
